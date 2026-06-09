@@ -17,7 +17,7 @@ The bot runs 24/7 on Railway and exposes a live dashboard at its public URL show
 
 ## Accounts you need
 
-1. **Crypto.com Exchange** — exchange.crypto.com (this is the trading platform, not the Crypto.com mobile app)
+1. **Crypto.com Exchange** — [https://exchange.crypto.com (https://exchange.crypto.com)] (this is the trading platform, not the Crypto.com mobile app)
 2. **Railway** — railway.app (where the bot runs)
 3. **GitHub** — github.com (connects your code to Railway)
 
