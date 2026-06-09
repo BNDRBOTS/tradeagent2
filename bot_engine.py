@@ -7,6 +7,11 @@ at signal-fire time and passed correctly to intelligence.record_trade at close.
 Previously signal_conditions={} and omega_score=0.0 were passed — intelligence
 engine was completely blind, load-bearing analysis and recursive amplifier had
 no data to learn from.
+
+FIX: intel context snapshot captured before _record_to_intelligence clears
+_pending_* fields, so _persist_trade receives real values and writes them to
+the database. Without this, the database stores hollow records that cannot
+replay meaningful intelligence on restart.
 """
 import asyncio
 import logging
@@ -85,7 +90,6 @@ class InstrumentEngine:
         self._last_atr_base:  float = float("nan")
 
         # Pending signal state — captured when signal fires, consumed at close
-        # FIX: these were never populated, causing intelligence to receive {} and 0.0
         self._pending_conditions:  Dict[str, bool] = {}
         self._pending_omega_score: float = 0.0
         self._pending_omega_tier:  str   = "UNKNOWN"
@@ -167,7 +171,6 @@ class InstrumentEngine:
             _push_risk(self._sizer)
             return
 
-        # ── Extract conditions (BEFORE scoring — these are what intelligence learns from) ─
         conditions     = _extract_conditions(audit)
         stop_d, target_d = self._strategy.get_stop_and_target()
         sizer_snap       = self._sizer.get_snapshot()
@@ -247,7 +250,6 @@ class InstrumentEngine:
                 stop_price=stop_price, target_price=target_price,
             )
 
-            # FIX: store signal context NOW while we have it — consumed at trade close
             self._pending_conditions  = conditions
             self._pending_omega_score = score.omega_final
             self._pending_omega_tier  = score.tier.label
@@ -332,8 +334,10 @@ class InstrumentEngine:
                     self._sizer.record_trade_pnl(closed.realized_pnl)
                     store.update_engine_state(self._instrument, "FLAT", None)
                     _push_risk(self._sizer)
+                    # Snapshot intel context BEFORE _record_to_intelligence clears _pending_*
+                    intel_ctx = self._snapshot_intel_context()
                     self._record_to_intelligence(closed, exit_reason, outcome)
-                    await self._persist_trade(closed, exit_reason)
+                    await self._persist_trade(closed, exit_reason, intel_ctx)
                     logger.info("[EXIT] %s %s @ %.4f | pnl=%.4f reason=%s",
                                 self._instrument, closed.direction,
                                 fill_price, closed.realized_pnl, exit_reason)
@@ -372,8 +376,10 @@ class InstrumentEngine:
                 self._sizer.record_trade_pnl(closed.realized_pnl)
                 store.update_engine_state(self._instrument, "FLAT", None)
                 _push_risk(self._sizer)
+                # Snapshot intel context BEFORE _record_to_intelligence clears _pending_*
+                intel_ctx = self._snapshot_intel_context()
                 self._record_to_intelligence(closed, reason, "TIMEOUT")
-                await self._persist_trade(closed, reason)
+                await self._persist_trade(closed, reason, intel_ctx)
                 logger.info("[FORCE_CLOSE] %s pnl=%.4f", self._instrument, closed.realized_pnl)
         except Exception as exc:
             logger.critical("[%s] Force close FAILED: %s", self._instrument, exc)
@@ -388,20 +394,29 @@ class InstrumentEngine:
         _push_risk(self._sizer)
         self._clear_pending()
 
+    def _snapshot_intel_context(self) -> Dict:
+        """
+        Capture intelligence context before _record_to_intelligence clears
+        _pending_* fields. This snapshot is passed to _persist_trade so the
+        database stores the same values the intelligence engine receives.
+        """
+        return {
+            "signal_conditions": dict(self._pending_conditions),
+            "spread_pct":        self._spread_pct,
+            "regime_state":      self._pending_regime,
+            "omega_score":       self._pending_omega_score,
+            "omega_tier":        self._pending_omega_tier,
+        }
+
     def _record_to_intelligence(self, closed, exit_reason: str, outcome: str) -> None:
-        """
-        Record closed trade to intelligence engine.
-        FIX: now uses _pending_conditions and _pending_omega_score captured at signal time.
-        Previously passed signal_conditions={} and omega_score=0.0 — intelligence was blind.
-        """
         try:
             bars_held = max(0, self._sm._current_bar - (closed.entry_bar if hasattr(closed, "entry_bar") else 0))
             self._intel.record_trade(
                 direction=closed.direction,
-                signal_conditions=self._pending_conditions,   # FIX: real data now
+                signal_conditions=self._pending_conditions,
                 spread_pct=self._spread_pct,
                 regime_state=self._pending_regime,
-                omega_score=self._pending_omega_score,        # FIX: real data now
+                omega_score=self._pending_omega_score,
                 omega_tier=self._pending_omega_tier,
                 outcome=outcome,
                 realized_pnl=closed.realized_pnl,
@@ -420,7 +435,7 @@ class InstrumentEngine:
         self._pending_omega_tier  = "UNKNOWN"
         self._pending_regime      = "MIXED"
 
-    async def _persist_trade(self, closed, exit_reason: str) -> None:
+    async def _persist_trade(self, closed, exit_reason: str, intel_ctx: Dict) -> None:
         store.record_closed_trade(
             instrument=self._instrument, direction=closed.direction,
             fill_price=closed.fill_price, exit_price=closed.exit_price,
@@ -432,12 +447,22 @@ class InstrumentEngine:
         try:
             from dashboard.persistence import insert_trade
             await insert_trade(
-                instrument=self._instrument, direction=closed.direction,
-                fill_price=closed.fill_price, exit_price=closed.exit_price,
-                quantity=closed.fill_qty, stop_price=closed.stop_price,
-                target_price=closed.target_price, exit_reason=exit_reason,
+                instrument=self._instrument,
+                direction=closed.direction,
+                fill_price=closed.fill_price,
+                exit_price=closed.exit_price,
+                quantity=closed.fill_qty,
+                stop_price=closed.stop_price,
+                target_price=closed.target_price,
+                exit_reason=exit_reason,
                 realized_pnl=closed.realized_pnl,
-                entry_ts=closed.entry_ts, exit_ts=closed.exit_ts,
+                entry_ts=closed.entry_ts,
+                exit_ts=closed.exit_ts,
+                signal_conditions=intel_ctx.get("signal_conditions", {}),
+                spread_pct=intel_ctx.get("spread_pct", 0.0),
+                regime_state=intel_ctx.get("regime_state", "MIXED"),
+                omega_score=intel_ctx.get("omega_score", 0.0),
+                omega_tier=intel_ctx.get("omega_tier", "UNKNOWN"),
             )
         except Exception as exc:
             logger.warning("SQLite insert failed (in-memory backup intact): %s", exc)
