@@ -2,19 +2,16 @@
 Entry point. Full startup sequence:
 1. Logging
 2. Env validation
-3. DB init
-4. Web server starts FIRST — Railway health check responds immediately.
-   Previously uvicorn started after the backtest, so the health check timed
-   out and Railway served a 502 before anyone could see the dashboard.
-5. Backtest runs in a thread (asyncio.to_thread) so the event loop stays free
-   and uvicorn can serve the dashboard/health check during the backtest run.
-6. DRY_RUN mode: gate failures are non-fatal. Dashboard shows degraded status.
-   Bot watches markets but places no orders. No real money, no hard exit.
-7. LIVE mode: gate failures halt bot tasks but keep the dashboard alive so you
-   can see exactly what failed before connecting real funds.
-8. asyncio.gather: uvicorn web server + WS bot + daily reset + balance sync + kill monitor
-   Kill monitor watches store.kill_event; when set, cancels bot tasks while
-   keeping web server live.
+3. DB init (+ schema migration for v2 intelligence columns)
+4. Web server starts FIRST — Railway health check responds immediately
+5. Backtest runs in a thread so uvicorn stays responsive during it
+6. Intelligence replay — loads all past trades from SQLite and feeds them
+   through each engine's intelligence layer in chronological order, exactly
+   as live trades feed it. Bot resumes where it left off. Requires Railway
+   Volume so the database file survives redeploys.
+7. DRY_RUN mode: gate failures are non-fatal warnings, dashboard shows status
+8. LIVE mode: gate failures halt bot tasks, dashboard stays alive
+9. asyncio.gather: uvicorn + WS bot + daily reset + balance sync + kill monitor
 """
 import asyncio
 import logging
@@ -31,7 +28,7 @@ from backtest.engine import run_startup_backtest
 from bot_engine import InstrumentEngine
 from config import settings
 from dashboard.api import app as dashboard_app
-from dashboard.persistence import init_db
+from dashboard.persistence import init_db, fetch_all_trades
 from dashboard.state_store import store
 from risk.position_sizer import PositionSizer
 
@@ -53,6 +50,80 @@ def _validate_env() -> None:
             sys.exit(1)
     else:
         logger.warning("DRY_RUN=True — orders are simulated, not submitted")
+
+
+async def _replay_intelligence(btc_engine: InstrumentEngine,
+                               eth_engine: InstrumentEngine) -> None:
+    """
+    Load all past trades from the database in chronological order and feed
+    each one through the correct engine's intelligence layer. This is
+    identical to how live trades feed the intelligence engine — the engine
+    cannot distinguish a replay from a live record.
+
+    Must run after engines are created and before the WebSocket connects,
+    so the intelligence state is fully restored before the first live signal.
+    """
+    try:
+        past_trades = await fetch_all_trades()
+    except Exception as exc:
+        logger.warning("Intelligence replay skipped — database read failed: %s", exc)
+        return
+
+    if not past_trades:
+        logger.info("Intelligence replay: no past trades found — starting fresh")
+        return
+
+    btc_count = 0
+    eth_count = 0
+
+    for trade in past_trades:
+        instrument  = trade.get("instrument", "")
+        exit_reason = trade.get("exit_reason", "")
+
+        if exit_reason == "TARGET":
+            outcome = "WIN"
+        elif exit_reason == "STOP":
+            outcome = "STOP"
+        else:
+            outcome = "TIMEOUT"
+
+        replay_kwargs = dict(
+            direction          = trade.get("direction", "LONG"),
+            signal_conditions  = trade.get("signal_conditions") or {},
+            spread_pct         = float(trade.get("spread_pct") or 0.0),
+            regime_state       = trade.get("regime_state") or "MIXED",
+            omega_score        = float(trade.get("omega_score") or 0.0),
+            omega_tier         = trade.get("omega_tier") or "UNKNOWN",
+            outcome            = outcome,
+            realized_pnl       = float(trade.get("realized_pnl") or 0.0),
+            entry_price        = float(trade.get("fill_price") or 0.0),
+            exit_price         = float(trade.get("exit_price") or 0.0),
+            # duration_minutes stored in DB; bot runs H1 candles so bars ≈ hours
+            bars_held          = max(0, round(float(trade.get("duration_minutes") or 0) / 60)),
+        )
+
+        if instrument == settings.BTC_INSTRUMENT:
+            btc_engine._intel.record_trade(**replay_kwargs)
+            btc_count += 1
+        elif instrument == settings.ETH_INSTRUMENT:
+            eth_engine._intel.record_trade(**replay_kwargs)
+            eth_count += 1
+
+    logger.info(
+        "Intelligence replay complete — BTC: %d trades, ETH: %d trades restored",
+        btc_count, eth_count,
+    )
+
+    for engine, label in [(btc_engine, "BTC"), (eth_engine, "ETH")]:
+        report = engine._intel.get_last_report()
+        if report:
+            logger.info(
+                "  %s resumed: wr=%.1f%% load_bearers=%s consecutive_losses=%d",
+                label,
+                report.win_rate * 100,
+                [c for c, _ in report.load_bearing_conditions[:3]],
+                engine._intel.get_consecutive_losses(),
+            )
 
 
 async def _daily_reset_loop(sizer: PositionSizer) -> None:
@@ -90,17 +161,12 @@ async def main() -> None:
     _validate_env()
     store.set_startup(dry_run=settings.DRY_RUN)
 
-    # Init SQLite
+    # DB init runs schema migration for v2 intelligence columns automatically
     await init_db()
 
     rest = CryptoComRestClient()
 
     # ── Start web server FIRST ────────────────────────────────────────────────
-    # Railway health check hits /api/health. The old code started uvicorn only
-    # after the backtest completed — which meant a 502 if the health check fired
-    # before backtest finished, and a dead domain if the gate failed.
-    # Starting uvicorn here means the health check responds in under 1 second
-    # regardless of how long the backtest takes.
     port = int(os.environ.get("PORT", 8080))
     uvi_config = uvicorn.Config(dashboard_app, host="0.0.0.0", port=port,
                                 log_level="warning", loop="none")
@@ -108,13 +174,9 @@ async def main() -> None:
     web_task = asyncio.create_task(uvi_server.serve(), name="web")
     logger.info("Dashboard starting on port %d — health check active", port)
 
-    # Let uvicorn bind its socket before backtest starts
     await asyncio.sleep(1.0)
 
     # ── Backtest gate ─────────────────────────────────────────────────────────
-    # asyncio.to_thread runs the synchronous backtest (which uses time.sleep
-    # internally for rate-limit pacing) in a thread pool so the event loop
-    # stays free. Uvicorn can serve requests during the entire backtest run.
     logger.info("Running startup backtest — dashboard available during this")
     btc_result, eth_result = await asyncio.to_thread(run_startup_backtest, rest)
     store.set_backtest_results([btc_result, eth_result])
@@ -126,31 +188,19 @@ async def main() -> None:
     if failures:
         for f in failures:
             logger.critical("  GATE FAIL: %s", f)
-
         if not settings.DRY_RUN:
-            # Real money is connected. Do not start bot tasks.
-            # Keep the dashboard alive so you can see what failed.
             logger.critical(
                 "LIVE MODE: startup gate failed — bot halted. "
-                "Dashboard is live at port %d. Review backtest panel before "
-                "connecting funds.", port
+                "Dashboard live at port %d. Review backtest panel before connecting funds.", port
             )
-
             async def _stub_kill_monitor() -> None:
                 await store.kill_event.wait()
-
             await asyncio.gather(web_task, _stub_kill_monitor(), return_exceptions=True)
             return
-
         else:
-            # DRY_RUN: no real money, no real orders regardless.
-            # Gate failures are shown in the dashboard backtest panel.
-            # The bot runs in observation mode — it watches the market,
-            # evaluates signals, logs what it would do, but never submits orders.
             logger.warning(
-                "DRY_RUN: strategies below backtest threshold — running in "
-                "observation mode. Dashboard shows degraded status. "
-                "No orders will be placed."
+                "DRY_RUN: strategies below backtest threshold — "
+                "running in observation mode, no orders placed."
             )
     else:
         logger.info("All backtest gates passed")
@@ -175,6 +225,11 @@ async def main() -> None:
     btc_engine = InstrumentEngine(settings.BTC_INSTRUMENT, settings.BTC_STRATEGY_CLASS, rest, sizer)
     eth_engine = InstrumentEngine(settings.ETH_INSTRUMENT, settings.ETH_STRATEGY_CLASS, rest, sizer)
 
+    # ── Intelligence replay ───────────────────────────────────────────────────
+    # After engines exist, before WebSocket connects. Restores everything the
+    # bot learned from past trades so a restart doesn't erase accumulated knowledge.
+    await _replay_intelligence(btc_engine, eth_engine)
+
     async def on_candlestick(instrument: str, candle: Dict) -> None:
         await btc_engine.on_candlestick(instrument, candle)
         await eth_engine.on_candlestick(instrument, candle)
@@ -198,7 +253,6 @@ async def main() -> None:
         on_order_update=on_order_update,
     )
 
-    # Bot tasks — cancelled by kill switch, web_task stays alive
     bot_tasks = [
         asyncio.create_task(ws.start(),                      name="ws"),
         asyncio.create_task(_daily_reset_loop(sizer),         name="daily_reset"),
