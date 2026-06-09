@@ -3,11 +3,18 @@ Entry point. Full startup sequence:
 1. Logging
 2. Env validation
 3. DB init
-4. Backtest gate (sys.exit(2) on failure)
-5. Cancel-on-disconnect via REST
-6. Balance sync
-7. asyncio.gather: uvicorn web server + WS bot + daily reset + balance sync + kill monitor
-Kill monitor watches store.kill_event; when set, cancels bot tasks while keeping web server live.
+4. Web server starts FIRST — Railway health check responds immediately.
+   Previously uvicorn started after the backtest, so the health check timed
+   out and Railway served a 502 before anyone could see the dashboard.
+5. Backtest runs in a thread (asyncio.to_thread) so the event loop stays free
+   and uvicorn can serve the dashboard/health check during the backtest run.
+6. DRY_RUN mode: gate failures are non-fatal. Dashboard shows degraded status.
+   Bot watches markets but places no orders. No real money, no hard exit.
+7. LIVE mode: gate failures halt bot tasks but keep the dashboard alive so you
+   can see exactly what failed before connecting real funds.
+8. asyncio.gather: uvicorn web server + WS bot + daily reset + balance sync + kill monitor
+   Kill monitor watches store.kill_event; when set, cancels bot tasks while
+   keeping web server live.
 """
 import asyncio
 import logging
@@ -86,21 +93,67 @@ async def main() -> None:
     # Init SQLite
     await init_db()
 
-    # Backtest gate
     rest = CryptoComRestClient()
-    btc_result, eth_result = run_startup_backtest(rest)
+
+    # ── Start web server FIRST ────────────────────────────────────────────────
+    # Railway health check hits /api/health. The old code started uvicorn only
+    # after the backtest completed — which meant a 502 if the health check fired
+    # before backtest finished, and a dead domain if the gate failed.
+    # Starting uvicorn here means the health check responds in under 1 second
+    # regardless of how long the backtest takes.
+    port = int(os.environ.get("PORT", 8080))
+    uvi_config = uvicorn.Config(dashboard_app, host="0.0.0.0", port=port,
+                                log_level="warning", loop="none")
+    uvi_server = uvicorn.Server(uvi_config)
+    web_task = asyncio.create_task(uvi_server.serve(), name="web")
+    logger.info("Dashboard starting on port %d — health check active", port)
+
+    # Let uvicorn bind its socket before backtest starts
+    await asyncio.sleep(1.0)
+
+    # ── Backtest gate ─────────────────────────────────────────────────────────
+    # asyncio.to_thread runs the synchronous backtest (which uses time.sleep
+    # internally for rate-limit pacing) in a thread pool so the event loop
+    # stays free. Uvicorn can serve requests during the entire backtest run.
+    logger.info("Running startup backtest — dashboard available during this")
+    btc_result, eth_result = await asyncio.to_thread(run_startup_backtest, rest)
     store.set_backtest_results([btc_result, eth_result])
 
     failures = [f"[{r.instrument}] {f}"
                 for r in [btc_result, eth_result]
                 for f in r.gate_failures]
-    if failures:
-        logger.critical("STARTUP GATE FAILED — bot will not start")
-        for f in failures:
-            logger.critical("  FAIL: %s", f)
-        sys.exit(2)
 
-    logger.info("All backtest gates passed")
+    if failures:
+        for f in failures:
+            logger.critical("  GATE FAIL: %s", f)
+
+        if not settings.DRY_RUN:
+            # Real money is connected. Do not start bot tasks.
+            # Keep the dashboard alive so you can see what failed.
+            logger.critical(
+                "LIVE MODE: startup gate failed — bot halted. "
+                "Dashboard is live at port %d. Review backtest panel before "
+                "connecting funds.", port
+            )
+
+            async def _stub_kill_monitor() -> None:
+                await store.kill_event.wait()
+
+            await asyncio.gather(web_task, _stub_kill_monitor(), return_exceptions=True)
+            return
+
+        else:
+            # DRY_RUN: no real money, no real orders regardless.
+            # Gate failures are shown in the dashboard backtest panel.
+            # The bot runs in observation mode — it watches the market,
+            # evaluates signals, logs what it would do, but never submits orders.
+            logger.warning(
+                "DRY_RUN: strategies below backtest threshold — running in "
+                "observation mode. Dashboard shows degraded status. "
+                "No orders will be placed."
+            )
+    else:
+        logger.info("All backtest gates passed")
 
     if not settings.DRY_RUN:
         try:
@@ -145,19 +198,12 @@ async def main() -> None:
         on_order_update=on_order_update,
     )
 
-    port = int(os.environ.get("PORT", 8080))
-    uvi_config = uvicorn.Config(dashboard_app, host="0.0.0.0", port=port,
-                                log_level="warning", loop="none")
-    uvi_server = uvicorn.Server(uvi_config)
-    logger.info("Dashboard starting on port %d", port)
-
-    # Bot tasks (killed by kill switch)
+    # Bot tasks — cancelled by kill switch, web_task stays alive
     bot_tasks = [
-        asyncio.create_task(ws.start(),              name="ws"),
-        asyncio.create_task(_daily_reset_loop(sizer), name="daily_reset"),
-        asyncio.create_task(_balance_sync_loop(rest, sizer), name="balance_sync"),
+        asyncio.create_task(ws.start(),                      name="ws"),
+        asyncio.create_task(_daily_reset_loop(sizer),         name="daily_reset"),
+        asyncio.create_task(_balance_sync_loop(rest, sizer),  name="balance_sync"),
     ]
-    web_task = asyncio.create_task(uvi_server.serve(), name="web")
 
     async def _kill_monitor() -> None:
         await store.kill_event.wait()
